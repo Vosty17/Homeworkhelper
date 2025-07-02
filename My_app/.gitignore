@@ -1,1 +1,10 @@
 
+venv/
+.env
+*.pyc
+__pycache__/
+uploads/*
+!.keep
+*.db
+*.log
+.DS_Store
