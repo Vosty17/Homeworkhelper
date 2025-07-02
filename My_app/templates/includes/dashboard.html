@@ -1,1 +1,234 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Homework Helper - Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .sidebar {
+            height: 100vh;
+            background-color: #f8f9fa;
+        }
+        .main-content {
+            padding: 20px;
+        }
+        .subscription-card {
+            border-left: 5px solid #0d6efd;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <div class="row">
+            <!-- Sidebar -->
+            <div class="col-md-3 col-lg-2 d-md-block sidebar collapse">
+                <div class="position-sticky pt-3">
+                    <h4 class="text-center mb-4">Homework Helper</h4>
+                    <ul class="nav flex-column">
+                        <li class="nav-item">
+                            <a class="nav-link active" href="{{ url_for('dashboard') }}">
+                                Dashboard
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="{{ url_for('ask_question') }}">
+                                Ask Question
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="{{ url_for('logout') }}">
+                                Logout
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+
+            <!-- Main Content -->
+            <div class="col-md-9 col-lg-10 ms-sm-auto px-md-4 main-content">
+                <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+                    <h1 class="h2">Dashboard</h1>
+                    <div class="btn-toolbar mb-2 mb-md-0">
+                        <span class="me-3">Welcome, {{ user[1] }}</span>
+                    </div>
+                </div>
+
+                <!-- Subscription Status -->
+                <div class="row mb-4">
+                    <div class="col-md-6">
+                        <div class="card subscription-card">
+                            <div class="card-body">
+                                <h5 class="card-title">Subscription</h5>
+                                {% if subscription %}
+                                    <p class="card-text">
+                                        <strong>Plan:</strong> {{ 'Monthly' if subscription[0] == 'monthly' else 'Pay-per-Use' }}<br>
+                                        {% if subscription[0] == 'monthly' %}
+                                            <strong>Days Remaining:</strong> {{ (subscription[1]|string|to_datetime - now).days }}
+                                        {% endif %}
+                                    </p>
+                                    {% if subscription[0] != 'monthly' %}
+                                        <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#subscribeModal">
+                                            Upgrade to Monthly
+                                        </button>
+                                    {% endif %}
+                                {% else %}
+                                    <p class="card-text">No active subscription</p>
+                                    <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#subscribeModal">
+                                        Subscribe Now
+                                    </button>
+                                {% endif %}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-body">
+                                <h5 class="card-title">Account Info</h5>
+                                <p class="card-text">
+                                    <strong>Phone:</strong> {{ user[3] or 'Not set' }}<br>
+                                    <strong>Email:</strong> {{ user[2] or 'Not set' }}
+                                </p>
+                                <a href="#" class="btn btn-outline-secondary">Update Profile</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Recent Questions -->
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h5>Recent Questions</h5>
+                    </div>
+                    <div class="card-body">
+                        {% if questions %}
+                            <div class="table-responsive">
+                                <table class="table table-striped">
+                                    <thead>
+                                        <tr>
+                                            <th>Date</th>
+                                            <th>Type</th>
+                                            <th>Question</th>
+                                            <th>Cost (KES)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {% for q in questions %}
+                                            <tr>
+                                                <td>{{ q[5] }}</td>
+                                                <td>{{ q[1]|title }}</td>
+                                                <td>{{ q[2]|truncate(50) if q[2] else 'Image Question' }}</td>
+                                                <td>{{ q[6] }}</td>
+                                            </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                </table>
+                            </div>
+                        {% else %}
+                            <p>No questions asked yet.</p>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <!-- Payment History -->
+                <div class="card">
+                    <div class="card-header">
+                        <h5>Payment History</h5>
+                    </div>
+                    <div class="card-body">
+                        {% if payments %}
+                            <div class="table-responsive">
+                                <table class="table table-striped">
+                                    <thead>
+                                        <tr>
+                                            <th>Date</th>
+                                            <th>Amount (KES)</th>
+                                            <th>Receipt</th>
+                                            <th>Status</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {% for p in payments %}
+                                            <tr>
+                                                <td>{{ p[4] }}</td>
+                                                <td>{{ p[1] }}</td>
+                                                <td>{{ p[2] or 'Pending' }}</td>
+                                                <td>{{ p[3]|title }}</td>
+                                            </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                </table>
+                            </div>
+                        {% else %}
+                            <p>No payments yet.</p>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Subscribe Modal -->
+    <div class="modal fade" id="subscribeModal" tabindex="-1" aria-labelledby="subscribeModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="subscribeModalLabel">Subscribe</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <form id="subscribeForm" method="POST" action="{{ url_for('subscribe') }}">
+                    <div class="modal-body">
+                        <div class="mb-3">
+                            <label class="form-label">Select Plan</label>
+                            <select class="form-select" name="plan" required>
+                                <option value="monthly">Monthly Subscription - KES {{ pricing['monthly']['price'] }}</option>
+                                <option value="pay_per_use">Pay-per-Use - KES {{ pricing['pay_per_use']['price'] }} per question</option>
+                            </select>
+                        </div>
+                        <div class="alert alert-info">
+                            You will receive an M-Pesa payment request on your registered phone number.
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Subscribe</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Handle subscription form submission
+        document.getElementById('subscribeForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const form = e.target;
+            const formData = new FormData(form);
+            
+            try {
+                const response = await fetch(form.action, {
+                    method: 'POST',
+                    body: formData,
+                    headers: {
+                        'Accept': 'application/json'
+                    }
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('Subscription request sent! Please check your phone to complete payment.');
+                    location.reload();
+                } else {
+                    alert('Error: ' + result.error);
+                }
+            } catch (error) {
+                alert('An error occurred. Please try again.');
+            }
+        });
+    </script>
+</body>
+</html>
