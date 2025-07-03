@@ -7,15 +7,15 @@ pillow==10.0.0
 python-dotenv==1.0.0
 gunicorn==20.1.0
 
-# Database
-psycopg2-binary==2.9.6  # For PostgreSQL support
-sqlite3==0.0.0  # Included in Python stdlib (for development)
+# Database (choose one)
+psycopg2-binary==2.9.6  # For PostgreSQL
+# sqlite3==0.0.0  # Included in Python stdlib
 
 # Image Processing
-werkzeug==2.3.6  # For secure_filename and password hashing
+werkzeug==2.3.6  # For secure_filename
 
 # M-Pesa Integration
-pyopenssl==23.2.0  # Required for M-Pesa API SSL
+pyopenssl==23.2.0  # Required for M-Pesa
 
 # AI Integration
-deepseek-sdk==0.1.2  # If using official SDK (optional)
+deepseek-sdk==0.1.2  # If using official SDK
