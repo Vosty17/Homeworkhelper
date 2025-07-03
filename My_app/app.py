@@ -1,4 +1,3 @@
-
 import os
 import requests
 import base64
@@ -14,22 +13,24 @@ from PIL import Image
 import io
 import logging
 import psycopg2
-from psycopg2 import sql
+from psycopg2 import sql, errors
 from urllib.parse import urlparse
 import sqlite3
 
 # Initialize Flask app
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'dev-secret-key')
+app.config['SECRET_KEY'] = os.environ['FLASK_SECRET_KEY']  # No fallback!
 app.config['SESSION_TYPE'] = 'filesystem'
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg'}
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB upload limit
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
+        logging.FileHandler('app.log'),
         logging.StreamHandler()
     ]
 )
@@ -41,6 +42,7 @@ class Database:
     def __init__(self):
         self.conn = self.get_db_connection()
         self.create_tables()
+        self.create_indexes()
 
     def get_db_connection(self):
         """Connect to PostgreSQL in production, SQLite in development"""
@@ -60,6 +62,7 @@ class Database:
         else:
             # Development - SQLite
             conn = sqlite3.connect('homework_helper.db', check_same_thread=False)
+            conn.row_factory = sqlite3.Row
             logging.info("Connected to SQLite database")
         return conn
 
@@ -74,7 +77,8 @@ class Database:
             password_hash TEXT NOT NULL,
             email TEXT UNIQUE,
             phone TEXT UNIQUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active BOOLEAN DEFAULT TRUE
         )
         ''')
         
@@ -86,7 +90,8 @@ class Database:
             plan_type TEXT NOT NULL,
             start_date TIMESTAMP NOT NULL,
             end_date TIMESTAMP,
-            is_active BOOLEAN DEFAULT TRUE
+            is_active BOOLEAN DEFAULT TRUE,
+            payment_id INTEGER REFERENCES payments(id)
         )
         ''')
         
@@ -99,7 +104,8 @@ class Database:
             mpesa_receipt TEXT,
             phone_number TEXT NOT NULL,
             transaction_date TIMESTAMP,
-            status TEXT DEFAULT 'pending'
+            status TEXT DEFAULT 'pending',
+            CHECK (status IN ('pending', 'completed', 'failed'))
         )
         ''')
         
@@ -121,8 +127,29 @@ class Database:
         self.conn.commit()
         logging.info("Database tables created/verified")
 
+    def create_indexes(self):
+        cursor = self.conn.cursor()
+        try:
+            # Index for faster subscription checks
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_user_active 
+            ON subscriptions (user_id, end_date) WHERE is_active = TRUE
+            ''')
+            
+            # Index for payment lookups
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_payments_user_status 
+            ON payments (user_id, status)
+            ''')
+            
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"Index creation failed: {e}")
+            self.conn.rollback()
+
     def add_user(self, username, password, email=None, phone=None):
         password_hash = generate_password_hash(password)
+        cursor = None
         
         try:
             cursor = self.conn.cursor()
@@ -134,15 +161,24 @@ class Database:
             user_id = cursor.fetchone()[0]
             self.conn.commit()
             return user_id
+        except (psycopg2.IntegrityError, sqlite3.IntegrityError) as e:
+            self.conn.rollback()
+            raise ValueError("Username, email or phone already exists")
         except Exception as e:
-            logging.error(f"Error adding user: {str(e)}")
-            raise Exception("Username, email or phone already exists")
+            self.conn.rollback()
+            logging.error(f"Error adding user: {e}")
+            raise RuntimeError("Failed to create user")
+        finally:
+            if cursor:
+                cursor.close()
 
     def authenticate_user(self, username, password):
+        cursor = None
         try:
             cursor = self.conn.cursor()
             cursor.execute('''
-            SELECT id, password_hash FROM users WHERE username = %s
+            SELECT id, password_hash FROM users 
+            WHERE username = %s AND is_active = TRUE
             ''', (username,))
             result = cursor.fetchone()
             
@@ -154,91 +190,177 @@ class Database:
                 return user_id
             return None
         except Exception as e:
-            logging.error(f"Authentication error: {str(e)}")
+            logging.error(f"Authentication error: {e}")
             return None
+        finally:
+            if cursor:
+                cursor.close()
 
     def get_user(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        SELECT id, username, email, phone FROM users WHERE id = %s
-        ''', (user_id,))
-        return cursor.fetchone()
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            SELECT id, username, email, phone FROM users 
+            WHERE id = %s AND is_active = TRUE
+            ''', (user_id,))
+            return cursor.fetchone()
+        except Exception as e:
+            logging.error(f"Get user error: {e}")
+            return None
+        finally:
+            if cursor:
+                cursor.close()
 
     def get_user_subscription(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        SELECT plan_type, end_date FROM subscriptions 
-        WHERE user_id = %s AND is_active = TRUE AND end_date > CURRENT_TIMESTAMP
-        ORDER BY end_date DESC LIMIT 1
-        ''', (user_id,))
-        return cursor.fetchone()
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            SELECT plan_type, end_date FROM subscriptions 
+            WHERE user_id = %s AND is_active = TRUE AND end_date > CURRENT_TIMESTAMP
+            ORDER BY end_date DESC LIMIT 1
+            ''', (user_id,))
+            return cursor.fetchone()
+        except Exception as e:
+            logging.error(f"Get subscription error: {e}")
+            return None
+        finally:
+            if cursor:
+                cursor.close()
 
     def create_subscription(self, user_id, plan_type, payment_id=None):
         start_date = datetime.now()
         end_date = start_date + timedelta(days=30) if plan_type == "monthly" else None
+        cursor = None
+        
+        try:
+            cursor = self.conn.cursor()
+            # Deactivate any existing subscriptions
+            cursor.execute('''
+            UPDATE subscriptions 
+            SET is_active = FALSE 
+            WHERE user_id = %s AND is_active = TRUE
+            ''', (user_id,))
             
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        INSERT INTO subscriptions (user_id, plan_type, start_date, end_date)
-        VALUES (%s, %s, %s, %s)
-        RETURNING id
-        ''', (user_id, plan_type, start_date, end_date))
-        sub_id = cursor.fetchone()[0]
-        self.conn.commit()
-        return sub_id
+            # Create new subscription
+            cursor.execute('''
+            INSERT INTO subscriptions (user_id, plan_type, start_date, end_date, payment_id)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            ''', (user_id, plan_type, start_date, end_date, payment_id))
+            
+            sub_id = cursor.fetchone()[0]
+            self.conn.commit()
+            return sub_id
+        except Exception as e:
+            self.conn.rollback()
+            logging.error(f"Create subscription error: {e}")
+            raise RuntimeError("Failed to create subscription")
+        finally:
+            if cursor:
+                cursor.close()
 
     def create_payment(self, user_id, amount, phone_number):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        INSERT INTO payments (user_id, amount, phone_number, transaction_date)
-        VALUES (%s, %s, %s, %s)
-        RETURNING id
-        ''', (user_id, amount, phone_number, datetime.now()))
-        payment_id = cursor.fetchone()[0]
-        self.conn.commit()
-        return payment_id
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            INSERT INTO payments (user_id, amount, phone_number, transaction_date)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            ''', (user_id, amount, phone_number, datetime.now()))
+            
+            payment_id = cursor.fetchone()[0]
+            self.conn.commit()
+            return payment_id
+        except Exception as e:
+            self.conn.rollback()
+            logging.error(f"Create payment error: {e}")
+            raise RuntimeError("Failed to create payment record")
+        finally:
+            if cursor:
+                cursor.close()
 
     def update_payment(self, payment_id, mpesa_receipt, status='completed'):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        UPDATE payments 
-        SET mpesa_receipt = %s, status = %s, transaction_date = %s
-        WHERE id = %s
-        ''', (mpesa_receipt, status, datetime.now(), payment_id))
-        self.conn.commit()
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            UPDATE payments 
+            SET mpesa_receipt = %s, status = %s, transaction_date = %s
+            WHERE id = %s
+            ''', (mpesa_receipt, status, datetime.now(), payment_id))
+            
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logging.error(f"Update payment error: {e}")
+            raise RuntimeError("Failed to update payment")
+        finally:
+            if cursor:
+                cursor.close()
 
     def record_question(self, user_id, question_type, content, image_path, response, cost, payment_id=None):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        INSERT INTO questions (user_id, question_type, content, image_path, response, cost, payment_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-        ''', (user_id, question_type, content, image_path, response, cost, payment_id))
-        question_id = cursor.fetchone()[0]
-        self.conn.commit()
-        return question_id
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            INSERT INTO questions (user_id, question_type, content, image_path, response, cost, payment_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            ''', (user_id, question_type, content, image_path, response, cost, payment_id))
+            
+            question_id = cursor.fetchone()[0]
+            self.conn.commit()
+            return question_id
+        except Exception as e:
+            self.conn.rollback()
+            logging.error(f"Record question error: {e}")
+            raise RuntimeError("Failed to record question")
+        finally:
+            if cursor:
+                cursor.close()
 
     def get_user_questions(self, user_id, limit=10):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        SELECT id, question_type, content, image_path, response, timestamp, cost 
-        FROM questions 
-        WHERE user_id = %s
-        ORDER BY timestamp DESC
-        LIMIT %s
-        ''', (user_id, limit))
-        return cursor.fetchall()
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            SELECT id, question_type, content, image_path, response, timestamp, cost 
+            FROM questions 
+            WHERE user_id = %s
+            ORDER BY timestamp DESC
+            LIMIT %s
+            ''', (user_id, limit))
+            
+            return cursor.fetchall()
+        except Exception as e:
+            logging.error(f"Get questions error: {e}")
+            return []
+        finally:
+            if cursor:
+                cursor.close()
 
     def get_user_payments(self, user_id, limit=10):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        SELECT id, amount, mpesa_receipt, status, transaction_date 
-        FROM payments 
-        WHERE user_id = %s
-        ORDER BY transaction_date DESC
-        LIMIT %s
-        ''', (user_id, limit))
-        return cursor.fetchall()
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            SELECT id, amount, mpesa_receipt, status, transaction_date 
+            FROM payments 
+            WHERE user_id = %s
+            ORDER BY transaction_date DESC
+            LIMIT %s
+            ''', (user_id, limit))
+            
+            return cursor.fetchall()
+        except Exception as e:
+            logging.error(f"Get payments error: {e}")
+            return []
+        finally:
+            if cursor:
+                cursor.close()
 
 class MpesaGateway:
     def __init__(self):
@@ -258,16 +380,16 @@ class MpesaGateway:
         auth = (self.consumer_key, self.consumer_secret)
         
         try:
-            response = requests.get(auth_url, auth=auth)
+            response = requests.get(auth_url, auth=auth, timeout=10)
             response.raise_for_status()
             data = response.json()
             self.access_token = data['access_token']
             self.token_expiry = datetime.now() + timedelta(seconds=data['expires_in'] - 60)
             return self.access_token
-        except Exception as e:
-            logging.error(f"Failed to get M-Pesa access token: {str(e)}")
-            raise Exception(f"Failed to get access token: {str(e)}")
-    
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to get M-Pesa access token: {e}")
+            raise RuntimeError("M-Pesa authentication failed")
+
     def stk_push(self, phone_number, amount, account_reference, description):
         token = self.get_access_token()
         timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
@@ -298,13 +420,14 @@ class MpesaGateway:
             response = requests.post(
                 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
                 headers=headers,
-                json=payload
+                json=payload,
+                timeout=15
             )
             response.raise_for_status()
             return response.json()
-        except Exception as e:
-            logging.error(f"STK push failed: {str(e)}")
-            raise Exception(f"STK push failed: {str(e)}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"STK push failed: {e}")
+            raise RuntimeError("Payment request failed")
 
 # Initialize services
 db = Database()
@@ -318,18 +441,32 @@ PRICING = {
 
 # Helper functions
 def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+    if not filename:
+        return False
+    # Prevent directory traversal
+    if '../' in filename or '..\\' in filename:
+        return False
+    return ('.' in filename and 
+            filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS'])
 
 def process_image(image_path):
-    with Image.open(image_path) as img:
-        if max(img.size) > 1024:
-            img.thumbnail((1024, 1024))
-        
-        buffered = io.BytesIO()
-        img_format = "PNG"
-        img.save(buffered, format=img_format)
-        return base64.b64encode(buffered.getvalue()).decode('utf-8')
+    try:
+        with Image.open(image_path) as img:
+            # Convert to RGB if needed (for PNG with transparency)
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+            
+            # Resize if too large
+            if max(img.size) > 1024:
+                img.thumbnail((1024, 1024))
+            
+            # Optimize image quality
+            buffered = io.BytesIO()
+            img.save(buffered, format='JPEG', quality=85)
+            return base64.b64encode(buffered.getvalue()).decode('utf-8')
+    except Exception as e:
+        logging.error(f"Image processing failed: {e}")
+        raise RuntimeError("Failed to process image")
 
 def get_ai_response(prompt, image_base64=None):
     headers = {
@@ -356,13 +493,14 @@ def get_ai_response(prompt, image_base64=None):
         response = requests.post(
             "https://api.deepseek.com/v1/chat/completions",
             headers=headers,
-            json=payload
+            json=payload,
+            timeout=30
         )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logging.error(f"AI API error: {str(e)}")
-        raise Exception(f"AI API error: {str(e)}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"AI API error: {e}")
+        raise RuntimeError("AI service is currently unavailable. Please try again later.")
 
 # Routes
 @app.route('/')
@@ -374,8 +512,11 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
+        
+        if not username or not password:
+            return render_template('login.html', error="Username and password are required")
         
         try:
             user_id = db.authenticate_user(username, password)
@@ -385,23 +526,30 @@ def login():
             else:
                 return render_template('login.html', error="Invalid credentials")
         except Exception as e:
-            return render_template('login.html', error=str(e))
+            logging.error(f"Login error: {e}")
+            return render_template('login.html', error="Login failed. Please try again.")
     
     return render_template('login.html')
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-        email = request.form.get('email')
-        phone = request.form.get('phone')
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
+        email = request.form.get('email', '').strip()
+        phone = request.form.get('phone', '').strip()
+        
+        if not username or not password:
+            return render_template('register.html', error="Username and password are required")
         
         try:
             db.add_user(username, password, email, phone)
             return redirect(url_for('login'))
-        except Exception as e:
+        except ValueError as e:
             return render_template('register.html', error=str(e))
+        except Exception as e:
+            logging.error(f"Registration error: {e}")
+            return render_template('register.html', error="Registration failed. Please try again.")
     
     return render_template('register.html')
 
@@ -413,6 +561,10 @@ def dashboard():
     user_id = session['user_id']
     try:
         user = db.get_user(user_id)
+        if not user:
+            session.clear()
+            return redirect(url_for('login'))
+        
         subscription = db.get_user_subscription(user_id)
         questions = db.get_user_questions(user_id)
         payments = db.get_user_payments(user_id)
@@ -424,8 +576,8 @@ def dashboard():
                              payments=payments,
                              pricing=PRICING)
     except Exception as e:
-        logging.error(f"Dashboard error: {str(e)}")
-        return render_template('500.html'), 500
+        logging.error(f"Dashboard error: {e}")
+        return render_template('error.html', message="Failed to load dashboard"), 500
 
 @app.route('/ask', methods=['GET', 'POST'])
 def ask_question():
@@ -434,18 +586,24 @@ def ask_question():
     
     user_id = session['user_id']
     user = db.get_user(user_id)
+    if not user:
+        session.clear()
+        return redirect(url_for('login'))
     
     if request.method == 'POST':
-        question = request.form.get('question')
+        question = request.form.get('question', '').strip()
         image = request.files.get('image')
         
         if not question and not image:
             return render_template('ask.html', error="Please provide a question or image")
         
         try:
-            # Process payment
+            # Check subscription first
             subscription = db.get_user_subscription(user_id)
+            payment_id = None
+            
             if not subscription or subscription[0] != "monthly":
+                # Process payment for non-subscribers
                 payment_id = db.create_payment(user_id, PRICING['pay_per_use']['price'], user[3])
                 response = mpesa.stk_push(
                     phone_number=user[3],
@@ -455,14 +613,10 @@ def ask_question():
                 )
                 
                 if 'ResponseCode' not in response or response['ResponseCode'] != '0':
-                    raise Exception("Payment initiation failed")
+                    raise RuntimeError("Payment initiation failed")
                 
-                # Simulate payment confirmation (in prod, use webhook)
-                time.sleep(10)
-                mpesa_receipt = f"HW{payment_id}{secrets.token_hex(4)}"
-                db.update_payment(payment_id, mpesa_receipt)
-            else:
-                payment_id = None
+                # In production, wait for callback instead of sleeping
+                return render_template('payment_pending.html', payment_id=payment_id)
             
             # Process question
             image_path = None
@@ -492,9 +646,11 @@ def ask_question():
             
             return render_template('response.html', response=ai_response, image_path=image_path)
             
-        except Exception as e:
-            logging.error(f"Ask question error: {str(e)}")
+        except RuntimeError as e:
             return render_template('ask.html', error=str(e))
+        except Exception as e:
+            logging.error(f"Ask question error: {e}")
+            return render_template('ask.html', error="Failed to process question. Please try again.")
     
     return render_template('ask.html')
 
@@ -505,8 +661,10 @@ def subscribe():
     
     user_id = session['user_id']
     user = db.get_user(user_id)
-    plan = request.form.get('plan')
+    if not user:
+        return jsonify({"success": False, "error": "User not found"}), 404
     
+    plan = request.form.get('plan')
     if plan not in PRICING:
         return jsonify({"success": False, "error": "Invalid plan"}), 400
     
@@ -520,18 +678,17 @@ def subscribe():
         )
         
         if 'ResponseCode' not in response or response['ResponseCode'] != '0':
-            raise Exception("Payment initiation failed")
+            raise RuntimeError("Payment initiation failed")
         
-        # Simulate payment confirmation
-        time.sleep(10)
-        mpesa_receipt = f"SUB{payment_id}{secrets.token_hex(4)}"
-        db.update_payment(payment_id, mpesa_receipt)
-        db.create_subscription(user_id, plan, payment_id)
-        
-        return jsonify({"success": True, "receipt": mpesa_receipt})
-    except Exception as e:
-        logging.error(f"Subscription error: {str(e)}")
+        return jsonify({
+            "success": True,
+            "message": "Payment initiated. You'll be notified when completed."
+        })
+    except RuntimeError as e:
         return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        logging.error(f"Subscription error: {e}")
+        return jsonify({"success": False, "error": "Subscription failed"}), 500
 
 @app.route('/callback', methods=['POST'])
 def callback():
@@ -540,17 +697,26 @@ def callback():
         data = request.get_json()
         logging.info(f"Received M-Pesa callback: {data}")
         
-        # In production: Verify the callback and update payment status
-        # This is a simplified implementation
+        # Example implementation (simplified)
+        result_code = data.get('Body', {}).get('stkCallback', {}).get('ResultCode')
+        merchant_request_id = data.get('Body', {}).get('stkCallback', {}).get('MerchantRequestID')
+        checkout_request_id = data.get('Body', {}).get('stkCallback', {}).get('CheckoutRequestID')
         
-        # Example implementation:
-        # if data.get('Body').get('stkCallback').get('ResultCode') == 0:
-        #     merchant_request_id = data['Body']['stkCallback']['MerchantRequestID']
-        #     update_payment_status(merchant_request_id, 'completed')
+        if result_code == '0':
+            # Payment successful
+            # In a real app, you would:
+            # 1. Verify the callback is from M-Pesa
+            # 2. Update your database
+            # 3. Handle subscriptions if applicable
+            
+            # For demo purposes, we'll just log it
+            logging.info(f"Payment successful: {merchant_request_id}")
+        else:
+            logging.warning(f"Payment failed: {data}")
         
         return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
     except Exception as e:
-        logging.error(f"Callback error: {str(e)}")
+        logging.error(f"Callback error: {e}")
         return jsonify({"ResultCode": 1, "ResultDesc": "Failed"}), 400
 
 @app.route('/logout')
@@ -565,7 +731,7 @@ def page_not_found(e):
 
 @app.errorhandler(500)
 def internal_error(e):
-    logging.error(f"Server error: {str(e)}")
+    logging.error(f"Server error: {e}")
     return render_template('500.html'), 500
 
 if __name__ == '__main__':
@@ -576,4 +742,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     
     # Run the app
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, threaded=True)
