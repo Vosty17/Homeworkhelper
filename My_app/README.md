@@ -1,5 +1,6 @@
 # Homework Helper AI (Flask + DeepSeek + M-Pesa)
 
+![#**HomeworkhelperAI**](https://github.com/Vosty17/Logo/blob/main/IMG-20250705-WA0000.jpg)
 A smart web app for Kenyan students and parents to get instant, AI-powered homework help—paid for easily with M-Pesa.
 
 ## Features
