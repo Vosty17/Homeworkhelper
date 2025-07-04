@@ -37,7 +37,7 @@ A smart web app for Kenyan students and parents to get instant, AI-powered homew
 5. **Track History:**  
    View your past questions and payment status in your dashboard.
    **Flowchart**
-   ![Logic Flowchart](https://github.com/Vosty17/Flowchart.git)
+   ![Logic Flowchart](https://github.com/Vosty17/Flowchart/blob/main/deepseek_mermaid_20250704_7cac08.png)
 
 ## Tech Stack
 
