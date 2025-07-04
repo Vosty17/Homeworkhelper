@@ -102,8 +102,3 @@ A smart web app for Kenyan students and parents to get instant, AI-powered homew
 ## License
 
 MIT
-
-Want to contribute or need help? Open an issue or reach out!  
-Ready to get started? 🚀
-
-Would you like a sample `.env` file or more setup tips?
